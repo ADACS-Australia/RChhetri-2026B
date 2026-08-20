@@ -13,23 +13,6 @@ services:
       - internal-network
     restart: unless-stopped
 
-  postgres:
-    image: postgres:14
-    container_name: postgres
-    networks:
-      - internal-network
-    environment:
-      POSTGRES_USER: prefect
-      POSTGRES_PASSWORD: prefect
-      POSTGRES_DB: prefect
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U prefect"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   redis:
     image: redis:7
     container_name: redis
@@ -54,7 +37,7 @@ services:
       - caddy
       - redis
     environment:
-      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://prefect:prefect@${PREFECT_API_DATABASE_CONNECTION_HOST}/prefect"
       PREFECT_SERVER_API_HOST: 0.0.0.0
       PREFECT_SERVER_UI_API_URL: "http://${PUBLIC_HOST}/api"
       PREFECT_SERVER_API_AUTH_STRING: "admin:${PREFECT_PASSWORD}"
@@ -80,7 +63,6 @@ services:
 volumes:
   redis_data:
   prefect_data:
-  postgres_data:
 
 networks:
   internal-network:
