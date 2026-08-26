@@ -5,7 +5,7 @@ services:
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST}
     volumes:
-      - ${HOME}/caddy/Caddyfile:/etc/caddy/Caddyfile
+      - ${HOME}/containers/caddy/Caddyfile:/etc/caddy/Caddyfile
     ports:
       - "80:80"
       - "443:443"
@@ -39,7 +39,7 @@ services:
     environment:
       PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://prefect:prefect@${PREFECT_API_DATABASE_CONNECTION_HOST}/prefect"
       PREFECT_SERVER_API_HOST: 0.0.0.0
-      PREFECT_SERVER_UI_API_URL: "http://${PUBLIC_HOST}/api"
+      PREFECT_SERVER_UI_API_URL: "https://${PUBLIC_HOST}/api"
       PREFECT_SERVER_API_AUTH_STRING: "admin:${PREFECT_PASSWORD}"
       PREFECT_MESSAGING_BROKER: prefect_redis.messaging
       PREFECT_MESSAGING_CACHE: prefect_redis.messaging
@@ -47,13 +47,15 @@ services:
       PREFECT_REDIS_MESSAGING_PORT: 6379
       PREFECT_REDIS_MESSAGING_DB: 0
     command: prefect server start
+    volumes:
+      - $HOME/container_data/prefect_data
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request as u; u.urlopen('http://${PUBLIC_HOST}/api/health', timeout=1)",
+          "import urllib.request as u; u.urlopen('https://${PUBLIC_HOST}/api/health', timeout=1)",
         ]
       interval: 30s
       timeout: 10s
@@ -62,7 +64,6 @@ services:
 
 volumes:
   redis_data:
-  prefect_data:
 
 networks:
   internal-network:
