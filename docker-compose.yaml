@@ -62,6 +62,25 @@ services:
       retries: 3
       start_period: 60s
 
+  prefect-worker:
+    image: prefecthq/prefect:3-latest
+    container_name: prefect-worker
+    networks:
+      - internal-network
+    depends_on:
+      - prefect-server
+    environment:
+      PREFECT_API_URL: "http://prefect:4200/api"
+      PREFECT_API_AUTH_STRING: "admin:${PREFECT_PASSWORD}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      /bin/sh -c "
+      (prefect work-pool create deploy-pool --type docker || true) &&
+      prefect worker start --pool deploy-pool
+      "
+    restart: unless-stopped
+
 volumes:
   redis_data:
 

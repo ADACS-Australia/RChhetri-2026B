@@ -1,0 +1,15 @@
+name: needle-deploy
+prefect-version: "3.0"
+
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/your-org/your-repo.git
+      branch: main
+
+deployments:
+  - name: deploy-to-ozstar
+    entrypoint: flows/deploy_ozstar.py:deploy
+    work_pool:
+      name: deploy-pool
+      job_variables:
+        image: "deploy-worker:latest"
