@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 
 from prefect import flow, task, get_run_logger
-from prefect.blocks.system import Secret, JSON
+from prefect.blocks.system import Secret
 
 
 @task
