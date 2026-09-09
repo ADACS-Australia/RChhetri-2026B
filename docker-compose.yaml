@@ -62,9 +62,12 @@ services:
       retries: 3
       start_period: 60s
 
-  prefect-worker:
-    image: prefecthq/prefect:3-latest
-    container_name: prefect-worker
+  deploy-worker:
+    build:
+      context: .
+      dockerfile: deploy-worker.Dockerfile
+    image: deploy-worker:latest
+    container_name: deploy-worker
     networks:
       - internal-network
     depends_on:

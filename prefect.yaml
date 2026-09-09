@@ -3,7 +3,7 @@ prefect-version: "3.0"
 
 pull:
   - prefect.deployments.steps.git_clone:
-      repository: https://github.com/your-org/your-repo.git
+      repository: https://github.com/ADACS-australia/RChhetri-2026B.git
       branch: main
 
 deployments:
@@ -13,3 +13,6 @@ deployments:
       name: deploy-pool
       job_variables:
         image: "deploy-worker:latest"
+        image_pull_policy: "Never"
+        auto_remove: false
+        networks: ["internal-network"]
