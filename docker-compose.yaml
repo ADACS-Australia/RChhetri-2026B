@@ -67,7 +67,7 @@ services:
     image: prefecthq/prefect:3-latest
     container_name: init-test-pool
     environment:
-      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_API_URL: https://${PUBLIC_HOST}/api
       PREFECT_API_AUTH_STRING: "admin:${PREFECT_PASSWORD}"
     entrypoint: ["/bin/sh", "-c"]
     command:
