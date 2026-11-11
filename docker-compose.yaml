@@ -63,10 +63,12 @@ services:
       start_period: 60s
 
   # Initialise the work pool
-  init-pool:
+  init-test-pool:
     image: prefecthq/prefect:3-latest
+    container_name: init-test-pool
     environment:
-      PREFECT_API_URL: http://your-server:4200/api
+      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_API_AUTH_STRING: "admin:${PREFECT_PASSWORD}"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
