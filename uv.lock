@@ -1367,8 +1367,8 @@ name = "pendulum"
 version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "python-dateutil" },
-    { name = "tzdata" },
+    { name = "python-dateutil", marker = "python_full_version < '3.15'" },
+    { name = "tzdata", marker = "python_full_version < '3.15'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d8/3f/345b5bc712ce806f3b5fbce6eea141f46713b2c1a7654eaead1b2593d5a1/pendulum-3.3.0.tar.gz", hash = "sha256:9aceb5b24e9f55381df08187397e88546b5ba82f698b741cbf1a05c5e2369116", size = 87458, upload-time = "2026-10-12T20:54:11.461Z" }
 wheels = [
@@ -1513,14 +1513,20 @@ name = "prefect-vm"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "astropy" },
     { name = "astroquery" },
     { name = "prefect" },
+    { name = "python-dotenv" },
+    { name = "requests" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "astropy", specifier = ">=5.0" },
     { name = "astroquery", specifier = ">=0.4.11" },
     { name = "prefect", specifier = ">=3.0,<4" },
+    { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "requests", specifier = ">=2.19" },
 ]
 
 [[package]]

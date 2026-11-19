@@ -1,13 +1,41 @@
 import os
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
+
+# Load the local .env before importing Prefect so its settings pick up the
+# API URL and auth string. Existing shell environment variables take priority.
+load_dotenv()
+
+_public_host = (
+    os.environ.get("PUBLIC_HOST", "")
+    .removeprefix("https://")
+    .removeprefix("http://")
+    .rstrip("/")
+)
+if _public_host and not os.environ.get("PREFECT_API_URL"):
+    os.environ["PREFECT_API_URL"] = f"https://{_public_host}/api"
+
+_prefect_password = os.environ.get("PREFECT_PASSWORD")
+if (
+    _prefect_password
+    and not os.environ.get("PREFECT_API_AUTH_STRING")
+    and not os.environ.get("PREFECT_API_KEY")
+):
+    os.environ["PREFECT_API_AUTH_STRING"] = f"admin:{_prefect_password}"
+
+import requests
+from astropy.io import fits
 from astroquery.utils.tap.core import TapPlus
 from prefect import flow, get_run_logger, task
 from prefect.deployments import run_deployment
 
 CASDA_TAP_URL = "https://casda.csiro.au/casda_vo_tools/tap"
+DAP_WS_URL = "https://data.csiro.au/dap/ws/v2/domains/casdaObservation"
 PROJECT_CODE = "AS305"
+CALIBRATOR_HEADER_KEY = "SB-CAL"
 LOOKBACK = timedelta(hours=1)
+ALL_TIME_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 # Deployment to trigger for each new observation, in the form
 # "flow-name/deployment-name". Override it with CASDA_PROCESSING_DEPLOYMENT.
@@ -23,7 +51,7 @@ def _adql_timestamp(value: datetime) -> str:
 
 
 def observation_query(start: datetime, end: datetime) -> str:
-    """Build the ADQL query for observations of PROJECT_CODE in [start, end]."""
+    """Build the ADQL query for observations of PROJECT_CODE deposited in [start, end]."""
     return f"""
         SELECT DISTINCT
             o.sbid,
@@ -32,26 +60,203 @@ def observation_query(start: datetime, end: datetime) -> str:
             o.obs_end,
             o.obs_program,
             o.deposit_state,
-            e.project_code
+            e.project_code,
+            e.event_date AS deposited_at
         FROM casda.observation AS o
         JOIN casda.observation_event AS e
             ON o.sbid = CAST(e.sbid AS INTEGER)
         WHERE e.project_code = '{PROJECT_CODE}'
-            AND o.obs_start >= '{_adql_timestamp(start)}'
-            AND o.obs_start < '{_adql_timestamp(end)}'
-        ORDER BY o.obs_start
+            AND e.event_type = 'DEPOSITED'
+            AND e.event_date >= '{_adql_timestamp(start)}'
+            AND e.event_date < '{_adql_timestamp(end)}'
+        ORDER BY deposited_at
     """
 
 
-@task(retries=3, retry_delay_seconds=60)
-def fetch_new_observations(start: datetime, end: datetime) -> list[dict]:
-    """Return the observations made in [start, end) for PROJECT_CODE."""
+def _tap_query(query: str) -> list[dict]:
+    """Run an ADQL query and return the rows as plain dictionaries."""
     tap = TapPlus(url=CASDA_TAP_URL)
-    results = tap.launch_job(observation_query(start, end)).get_results()
+    results = tap.launch_job(query).get_results()
     return [
         {name: value.item() if hasattr(value, "item") else value for name, value in zip(results.colnames, row)}
         for row in results
     ]
+
+
+def cube_query(obs_id: str) -> str:
+    """Build the query for the image cubes belonging to an observation."""
+    return f"""
+        SELECT
+            obs_publisher_did,
+            dataproduct_subtype,
+            filename,
+            obs_release_date
+        FROM ivoa.obscore
+        WHERE obs_id = '{obs_id}'
+            AND dataproduct_type = 'cube'
+        ORDER BY filename
+    """
+
+
+def observation_by_sbid_query(sbid: int) -> str:
+    """Build the query for a single observation by SBID."""
+    return f"""
+        SELECT DISTINCT
+            o.sbid,
+            e.obs_id,
+            e.project_code,
+            o.obs_start,
+            o.obs_end,
+            o.obs_program,
+            o.deposit_state
+        FROM casda.observation AS o
+        LEFT JOIN casda.observation_event AS e
+            ON o.sbid = CAST(e.sbid AS INTEGER)
+            AND e.event_type = 'DEPOSITED'
+        WHERE o.sbid = {int(sbid)}
+    """
+
+
+def _is_released(release_date) -> bool:
+    """Return whether a product's release date has passed."""
+    if release_date is None or str(release_date).strip() in ("", "--"):
+        return False
+
+    if isinstance(release_date, datetime):
+        released_at = release_date
+    else:
+        try:
+            released_at = datetime.fromisoformat(str(release_date).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+
+    if released_at.tzinfo is None:
+        released_at = released_at.replace(tzinfo=timezone.utc)
+
+    return released_at <= datetime.now(timezone.utc)
+
+
+def _cube_sort_key(cube: dict) -> tuple:
+    """Prefer the restored Stokes I continuum cube when choosing a header source."""
+    subtype = str(cube.get("dataproduct_subtype") or "")
+    filename = str(cube.get("filename") or "")
+    return (
+        not (subtype == "cont.restored.t0" and filename.startswith("image.i.")),
+        not subtype.startswith("cont.restored"),
+        not subtype.startswith("cont."),
+        filename,
+    )
+
+
+def fetch_product_metadata(product_type: str, product_id: int, *, released: bool) -> dict:
+    """Fetch a data product's metadata, including its FITS header, from the DAP web service."""
+    response = requests.get(
+        f"{DAP_WS_URL}/{product_type}/{product_id}/metadata",
+        params={"released": "true" if released else "false"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _cube_header(cube: dict) -> fits.Header | None:
+    """Return the FITS header for a cube, or None if it cannot be read."""
+    publisher_did = str(cube["obs_publisher_did"])
+    product_type, _, product_id = publisher_did.partition("-")
+    if product_type != "cube":
+        return None
+
+    try:
+        metadata = fetch_product_metadata(
+            "IMAGE_CUBE",
+            int(product_id),
+            released=_is_released(cube.get("obs_release_date")),
+        )
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 404):
+            return None
+        raise
+
+    cards = metadata.get("imageHeader")
+    if not cards:
+        return None
+
+    try:
+        return fits.Header([fits.Card.fromstring(card) for card in cards])
+    except (ValueError, TypeError, UnicodeError):
+        return None
+
+
+def match_calibrator(observation: dict) -> dict | None:
+    """Find the calibration observation referenced by an observation's image cube."""
+    cubes = _tap_query(cube_query(observation["obs_id"]))
+
+    for cube in sorted(cubes, key=_cube_sort_key):
+        header = _cube_header(cube)
+        if header is None or CALIBRATOR_HEADER_KEY not in header:
+            continue
+
+        try:
+            if "SBID" in header and int(header["SBID"]) != int(observation["sbid"]):
+                continue
+            calibrator_sbid = int(header[CALIBRATOR_HEADER_KEY])
+        except (TypeError, ValueError):
+            continue
+
+        rows = _tap_query(observation_by_sbid_query(calibrator_sbid))
+        if rows:
+            calibrator = rows[0]
+            if not calibrator.get("obs_id"):
+                calibrator["obs_id"] = f"ASKAP-{calibrator_sbid}"
+            return calibrator
+
+        return {
+            "sbid": calibrator_sbid,
+            "obs_id": f"ASKAP-{calibrator_sbid}",
+        }
+
+    return None
+
+
+def get_new_observations(start: datetime, end: datetime) -> list[dict]:
+    """Return the observations deposited in [start, end) for PROJECT_CODE."""
+    observations = _tap_query(observation_query(start, end))
+
+    # An observation can have more than one DEPOSITED event; keep the first.
+    unique = {}
+    for observation in observations:
+        unique.setdefault(observation.get("obs_id") or observation["sbid"], observation)
+    return list(unique.values())
+
+
+@task(retries=3, retry_delay_seconds=60)
+def fetch_new_observations(start: datetime, end: datetime) -> list[dict]:
+    """Return the observations deposited in [start, end) for PROJECT_CODE."""
+    return get_new_observations(start, end)
+
+
+@task(retries=2, retry_delay_seconds=30)
+def find_calibrator(observation: dict) -> dict | None:
+    """Match an observation to the calibrator referenced in its image cube header."""
+    logger = get_run_logger()
+    calibrator = match_calibrator(observation)
+
+    if calibrator is None:
+        logger.warning(
+            "Could not determine the calibrator for %s (SBID %s).",
+            observation["obs_id"],
+            observation["sbid"],
+        )
+    else:
+        logger.info(
+            "Matched %s (SBID %s) to calibrator %s (SBID %s).",
+            observation["obs_id"],
+            observation["sbid"],
+            calibrator["obs_id"],
+            calibrator["sbid"],
+        )
+
+    return calibrator
 
 
 @task(retries=2, retry_delay_seconds=30)
@@ -77,20 +282,28 @@ def trigger_processing(observation: dict) -> None:
 
 
 @flow(name="casda-query", log_prints=True)
-def casda_query() -> None:
-    """Check CASDA hourly for new observations under PROJECT_CODE."""
+def casda_query(
+    start: datetime | None = None,
+    end: datetime | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Check CASDA for newly deposited observations under PROJECT_CODE."""
     logger = get_run_logger()
 
-    # Cover the hour that has just finished. Flooring to the hour keeps
-    # consecutive runs contiguous even when the scheduler starts them late.
-    end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start = end - LOOKBACK
+    # By default, cover the hour that has just finished. Flooring to the hour
+    # keeps consecutive runs contiguous even if the scheduler starts them late.
+    if end is None:
+        end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if start is None:
+        start = end - LOOKBACK
+    if start >= end:
+        raise ValueError("start must be before end")
 
     observations = fetch_new_observations(start, end)
 
     if not observations:
         logger.info(
-            "No new %s observations between %s and %s.",
+            "No new %s observations deposited between %s and %s.",
             PROJECT_CODE,
             start.isoformat(),
             end.isoformat(),
@@ -98,7 +311,7 @@ def casda_query() -> None:
         return
 
     logger.info(
-        "Found %d new %s observation(s) between %s and %s:",
+        "Found %d new %s observation(s) deposited between %s and %s:",
         len(observations),
         PROJECT_CODE,
         start.isoformat(),
@@ -106,16 +319,105 @@ def casda_query() -> None:
     )
     for observation in observations:
         logger.info(
-            "Found %s (SBID %s): %s to %s [%s] %s",
+            "Found %s (SBID %s): %s to %s [%s] %s (deposited %s)",
             observation["obs_id"],
             observation["sbid"],
             observation["obs_start"],
             observation["obs_end"],
             observation["deposit_state"],
             observation["obs_program"],
+            observation["deposited_at"],
         )
-        trigger_processing(observation)
+
+        calibrator = find_calibrator(observation)
+        if calibrator is None:
+            logger.warning(
+                "Skipping %s (SBID %s): no image cube, FITS header or %s value.",
+                observation["obs_id"],
+                observation["sbid"],
+                CALIBRATOR_HEADER_KEY,
+            )
+            continue
+
+        if dry_run:
+            logger.info(
+                "Dry run: would trigger %s for %s.",
+                PROCESSING_DEPLOYMENT,
+                observation["obs_id"],
+            )
+            continue
+
+        trigger_processing({**observation, "calibrator": calibrator})
+
+
+def check_observations(start: datetime, end: datetime) -> None:
+    """Query a window and print calibrator matches without triggering deployments."""
+    observations = get_new_observations(start, end)
+
+    print(f"Found {len(observations)} observation(s) deposited between " f"{start.isoformat()} and {end.isoformat()}.")
+    for observation in observations:
+        calibrator = match_calibrator(observation)
+        line = f"  {observation['deposited_at']}  " f"{observation['obs_id']} (SBID {observation['sbid']})"
+        if calibrator is None:
+            print(f"{line}: no calibrator -> would be skipped")
+        else:
+            print(f"{line}: calibrator {calibrator['obs_id']} " f"(SBID {calibrator['sbid']})")
+
+
+def _parse_datetime(value: str) -> datetime:
+    """Parse an ISO 8601 datetime, assuming UTC when no timezone is given."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 if __name__ == "__main__":
-    casda_query.serve(name="casda-query", cron="0 * * * *")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Query CASDA for newly deposited observations.")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Query once and print matches without triggering deployments.",
+    )
+    parser.add_argument(
+        "--run-flow",
+        action="store_true",
+        help="Run the Prefect flow once for the selected window.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --run-flow, skip triggering deployments.",
+    )
+    parser.add_argument(
+        "--all-time",
+        action="store_true",
+        help="Query from 2000-01-01 up to now.",
+    )
+    parser.add_argument(
+        "--start",
+        type=_parse_datetime,
+        help="Start of the deposit window (ISO 8601, UTC assumed).",
+    )
+    parser.add_argument(
+        "--end",
+        type=_parse_datetime,
+        help="End of the deposit window (ISO 8601, UTC assumed).",
+    )
+    args = parser.parse_args()
+
+    if args.dry_run and not args.run_flow:
+        parser.error("--dry-run requires --run-flow")
+
+    if args.run_flow:
+        end = args.end or datetime.now(timezone.utc)
+        start = args.start or (ALL_TIME_START if args.all_time else end - LOOKBACK)
+        casda_query(start=start, end=end, dry_run=args.dry_run)
+    elif args.check or args.all_time or args.start or args.end:
+        end = args.end or datetime.now(timezone.utc)
+        start = args.start or (ALL_TIME_START if args.all_time else end - LOOKBACK)
+        check_observations(start, end)
+    else:
+        casda_query.serve(name="casda-query", cron="0 * * * *")
