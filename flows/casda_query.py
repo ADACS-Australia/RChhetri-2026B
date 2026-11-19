@@ -7,21 +7,12 @@ from dotenv import load_dotenv
 # API URL and auth string. Existing shell environment variables take priority.
 load_dotenv()
 
-_public_host = (
-    os.environ.get("PUBLIC_HOST", "")
-    .removeprefix("https://")
-    .removeprefix("http://")
-    .rstrip("/")
-)
+_public_host = os.environ.get("PUBLIC_HOST", "").removeprefix("https://").removeprefix("http://").rstrip("/")
 if _public_host and not os.environ.get("PREFECT_API_URL"):
     os.environ["PREFECT_API_URL"] = f"https://{_public_host}/api"
 
 _prefect_password = os.environ.get("PREFECT_PASSWORD")
-if (
-    _prefect_password
-    and not os.environ.get("PREFECT_API_AUTH_STRING")
-    and not os.environ.get("PREFECT_API_KEY")
-):
+if _prefect_password and not os.environ.get("PREFECT_API_AUTH_STRING") and not os.environ.get("PREFECT_API_KEY"):
     os.environ["PREFECT_API_AUTH_STRING"] = f"admin:{_prefect_password}"
 
 import requests
@@ -29,12 +20,16 @@ from astropy.io import fits
 from astroquery.utils.tap.core import TapPlus
 from prefect import flow, get_run_logger, task
 from prefect.deployments import run_deployment
+from prefect.runtime import flow_run
 
 CASDA_TAP_URL = "https://casda.csiro.au/casda_vo_tools/tap"
 DAP_WS_URL = "https://data.csiro.au/dap/ws/v2/domains/casdaObservation"
 PROJECT_CODE = "AS305"
 CALIBRATOR_HEADER_KEY = "SB-CAL"
-LOOKBACK = timedelta(hours=1)
+
+# One source of truth for both the serving schedule and the query window.
+SCHEDULE_INTERVAL = timedelta(minutes=30)
+
 ALL_TIME_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 # Deployment to trigger for each new observation, in the form
@@ -48,6 +43,34 @@ PROCESSING_DEPLOYMENT = os.environ.get(
 def _adql_timestamp(value: datetime) -> str:
     """Format a datetime as an ADQL-friendly ISO 8601 UTC string."""
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cron_for_interval(interval: timedelta) -> str:
+    """Return a cron expression for common fixed schedule intervals."""
+    total_minutes = int(interval.total_seconds() // 60)
+    if total_minutes <= 0:
+        raise ValueError("Schedule interval must be positive")
+
+    if total_minutes < 60:
+        if 60 % total_minutes == 0:
+            return f"*/{total_minutes} * * * *"
+        raise ValueError("Intervals under an hour must divide evenly into an hour.")
+
+    if total_minutes % 60 != 0:
+        raise ValueError("Schedule interval must be a whole number of hours.")
+
+    hours = total_minutes // 60
+    if hours == 1:
+        return "0 * * * *"
+    if hours == 24:
+        return "0 0 * * *"
+    if 1 < hours < 24 and 24 % hours == 0:
+        return f"0 */{hours} * * *"
+
+    raise ValueError(
+        "Unsupported schedule interval. Use a whole-hour interval that divides "
+        "evenly into 24 hours (1, 2, 3, 4, 6, 8, 12 or 24 hours)."
+    )
 
 
 def observation_query(start: datetime, end: datetime) -> str:
@@ -290,12 +313,12 @@ def casda_query(
     """Check CASDA for newly deposited observations under PROJECT_CODE."""
     logger = get_run_logger()
 
-    # By default, cover the hour that has just finished. Flooring to the hour
-    # keeps consecutive runs contiguous even if the scheduler starts them late.
+    # Align the default window to the scheduled run time. This keeps
+    # consecutive runs contiguous even when a run starts late.
     if end is None:
-        end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        end = flow_run.scheduled_start_time
     if start is None:
-        start = end - LOOKBACK
+        start = end - SCHEDULE_INTERVAL
     if start >= end:
         raise ValueError("start must be before end")
 
@@ -375,11 +398,12 @@ def _parse_datetime(value: str) -> datetime:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Query CASDA for newly deposited observations.")
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Query once and print matches without triggering deployments.",
+    parser = argparse.ArgumentParser(
+        description="Query CASDA for newly deposited observations.",
+        epilog=(
+            "Without --run-flow, --all-time/--start/--end perform a local check "
+            "only: no Prefect flow run and no deployments are created."
+        ),
     )
     parser.add_argument(
         "--run-flow",
@@ -389,7 +413,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="With --run-flow, skip triggering deployments.",
+        help="With --run-flow, run the flow but skip run_deployment.",
     )
     parser.add_argument(
         "--all-time",
@@ -413,11 +437,14 @@ if __name__ == "__main__":
 
     if args.run_flow:
         end = args.end or datetime.now(timezone.utc)
-        start = args.start or (ALL_TIME_START if args.all_time else end - LOOKBACK)
+        start = args.start or (ALL_TIME_START if args.all_time else end - SCHEDULE_INTERVAL)
         casda_query(start=start, end=end, dry_run=args.dry_run)
-    elif args.check or args.all_time or args.start or args.end:
+    elif args.all_time or args.start or args.end:
         end = args.end or datetime.now(timezone.utc)
-        start = args.start or (ALL_TIME_START if args.all_time else end - LOOKBACK)
+        start = args.start or (ALL_TIME_START if args.all_time else end - SCHEDULE_INTERVAL)
         check_observations(start, end)
     else:
-        casda_query.serve(name="casda-query", cron="0 * * * *")
+        casda_query.serve(
+            name="casda-query",
+            cron=cron_for_interval(SCHEDULE_INTERVAL),
+        )
