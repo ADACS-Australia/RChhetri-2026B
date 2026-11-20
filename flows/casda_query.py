@@ -36,7 +36,7 @@ ALL_TIME_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
 # "flow-name/deployment-name". Override it with CASDA_PROCESSING_DEPLOYMENT.
 PROCESSING_DEPLOYMENT = os.environ.get(
     "CASDA_PROCESSING_DEPLOYMENT",
-    "download-observation/download-observation",
+    "download-observation/download-observation-ozstar",
 )
 
 
@@ -121,25 +121,6 @@ def cube_query(obs_id: str) -> str:
     """
 
 
-def observation_by_sbid_query(sbid: int) -> str:
-    """Build the query for a single observation by SBID."""
-    return f"""
-        SELECT DISTINCT
-            o.sbid,
-            e.obs_id,
-            e.project_code,
-            o.obs_start,
-            o.obs_end,
-            o.obs_program,
-            o.deposit_state
-        FROM casda.observation AS o
-        LEFT JOIN casda.observation_event AS e
-            ON o.sbid = CAST(e.sbid AS INTEGER)
-            AND e.event_type = 'DEPOSITED'
-        WHERE o.sbid = {int(sbid)}
-    """
-
-
 def _is_released(release_date) -> bool:
     """Return whether a product's release date has passed."""
     if release_date is None or str(release_date).strip() in ("", "--"):
@@ -210,8 +191,8 @@ def _cube_header(cube: dict) -> fits.Header | None:
         return None
 
 
-def match_calibrator(observation: dict) -> dict | None:
-    """Find the calibration observation referenced by an observation's image cube."""
+def match_calibrator(observation: dict) -> int | None:
+    """Return the calibrator SBID referenced by an observation's image cube."""
     cubes = _tap_query(cube_query(observation["obs_id"]))
 
     for cube in sorted(cubes, key=_cube_sort_key):
@@ -222,21 +203,9 @@ def match_calibrator(observation: dict) -> dict | None:
         try:
             if "SBID" in header and int(header["SBID"]) != int(observation["sbid"]):
                 continue
-            calibrator_sbid = int(header[CALIBRATOR_HEADER_KEY])
+            return int(header[CALIBRATOR_HEADER_KEY])
         except (TypeError, ValueError):
             continue
-
-        rows = _tap_query(observation_by_sbid_query(calibrator_sbid))
-        if rows:
-            calibrator = rows[0]
-            if not calibrator.get("obs_id"):
-                calibrator["obs_id"] = f"ASKAP-{calibrator_sbid}"
-            return calibrator
-
-        return {
-            "sbid": calibrator_sbid,
-            "obs_id": f"ASKAP-{calibrator_sbid}",
-        }
 
     return None
 
@@ -259,12 +228,12 @@ def fetch_new_observations(start: datetime, end: datetime) -> list[dict]:
 
 
 @task(retries=2, retry_delay_seconds=30)
-def find_calibrator(observation: dict) -> dict | None:
+def find_calibrator(observation: dict) -> int | None:
     """Match an observation to the calibrator referenced in its image cube header."""
     logger = get_run_logger()
-    calibrator = match_calibrator(observation)
+    calibrator_sbid = match_calibrator(observation)
 
-    if calibrator is None:
+    if calibrator_sbid is None:
         logger.warning(
             "Could not determine the calibrator for %s (SBID %s).",
             observation["obs_id"],
@@ -272,34 +241,37 @@ def find_calibrator(observation: dict) -> dict | None:
         )
     else:
         logger.info(
-            "Matched %s (SBID %s) to calibrator %s (SBID %s).",
+            "Matched %s (SBID %s) to calibrator SBID %s.",
             observation["obs_id"],
             observation["sbid"],
-            calibrator["obs_id"],
-            calibrator["sbid"],
+            calibrator_sbid,
         )
 
-    return calibrator
+    return calibrator_sbid
 
 
 @task(retries=2, retry_delay_seconds=30)
-def trigger_processing(observation: dict) -> None:
-    """Trigger the processing deployment for a single observation."""
+def trigger_processing(target_sbid: int, calibrator_sbid: int) -> None:
+    """Trigger the download deployment for a target/calibrator SBID pair."""
     logger = get_run_logger()
 
     flow_run = run_deployment(
         PROCESSING_DEPLOYMENT,
-        parameters={"observation": observation},
-        flow_run_name=f"process-{observation['obs_id']}",
-        idempotency_key=f"casda-{observation['obs_id']}",
+        parameters={
+            "target_sbid": target_sbid,
+            "calibrator_sbid": calibrator_sbid,
+        },
+        flow_run_name=f"download-{target_sbid}",
+        idempotency_key=f"casda-{target_sbid}",
         timeout=0,
         as_subflow=False,
     )
 
     logger.info(
-        "Triggered %s for %s (flow run %s).",
+        "Triggered %s for target SBID %s with calibrator SBID %s (flow run %s).",
         PROCESSING_DEPLOYMENT,
-        observation["obs_id"],
+        target_sbid,
+        calibrator_sbid,
         flow_run.id,
     )
 
@@ -352,8 +324,8 @@ def casda_query(
             observation["deposited_at"],
         )
 
-        calibrator = find_calibrator(observation)
-        if calibrator is None:
+        calibrator_sbid = find_calibrator(observation)
+        if calibrator_sbid is None:
             logger.warning(
                 "Skipping %s (SBID %s): no image cube, FITS header or %s value.",
                 observation["obs_id"],
@@ -364,13 +336,14 @@ def casda_query(
 
         if dry_run:
             logger.info(
-                "Dry run: would trigger %s for %s.",
+                "Dry run: would trigger %s for target SBID %s with calibrator SBID %s.",
                 PROCESSING_DEPLOYMENT,
-                observation["obs_id"],
+                observation["sbid"],
+                calibrator_sbid,
             )
             continue
 
-        trigger_processing({**observation, "calibrator": calibrator})
+        trigger_processing(observation["sbid"], calibrator_sbid)
 
 
 def check_observations(start: datetime, end: datetime) -> None:
@@ -379,12 +352,12 @@ def check_observations(start: datetime, end: datetime) -> None:
 
     print(f"Found {len(observations)} observation(s) deposited between " f"{start.isoformat()} and {end.isoformat()}.")
     for observation in observations:
-        calibrator = match_calibrator(observation)
+        calibrator_sbid = match_calibrator(observation)
         line = f"  {observation['deposited_at']}  " f"{observation['obs_id']} (SBID {observation['sbid']})"
-        if calibrator is None:
+        if calibrator_sbid is None:
             print(f"{line}: no calibrator -> would be skipped")
         else:
-            print(f"{line}: calibrator {calibrator['obs_id']} " f"(SBID {calibrator['sbid']})")
+            print(f"{line}: calibrator SBID {calibrator_sbid}")
 
 
 def _parse_datetime(value: str) -> datetime:
