@@ -1,0 +1,17 @@
+[project]
+name = "prefect-vm"
+version = "0.1.0"
+description = "Prefect flows and deployment configuration for the ASKAP/CASDA VM"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "astropy>=5.0",
+    "astroquery>=0.4.11",
+    "prefect>=3.0,<4",
+    "python-dotenv>=1.0",
+    "requests>=2.19",
+]
+
+# This repository contains flow scripts rather than an importable library.
+[tool.uv]
+package = false
